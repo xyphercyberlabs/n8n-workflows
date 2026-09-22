@@ -45,5 +45,5 @@ MIT – siehe [LICENSE](LICENSE). Nutzung auf eigene Verantwortung, ohne Gewähr
 
 ---
 
-**Mirko Daether** · Prozessautomatisierung mit n8n · Neustrelitz
+**Mirko Daether** · Prozessautomatisierung mit n8n · Neustrelitz<br>
 Profil: [GULP](https://www.gulp.de/gulp2/g/spezialisten/profil/mirkodaether)
