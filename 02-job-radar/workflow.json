@@ -1,0 +1,193 @@
+{
+  "name": "Job-Radar v2 (RSS -> Merkliste -> Telegram)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Job-Radar v2 – RSS, Merkliste, Meldung\n\n**Was er tut:** Liest einmal täglich einen Projekt- oder Job-Feed, wirft alles weg, was unter den eigenen Schwellen liegt, und schickt eine kurze Meldung – ohne dieselben Einträge am nächsten Tag noch einmal zu melden.\n\n**Der eigentliche Kniff: die Merkliste.**\nJeder gemeldete Eintrag landet mit Zeitstempel in `$getWorkflowStaticData('global')`. Beim nächsten Lauf wird er übersprungen. Einträge, die älter als 30 Tage sind, werden automatisch gelöscht – sonst wächst die Liste unbegrenzt.\n\n**Wichtig zu wissen**\n- `staticData` wird **nur bei produktiven Ausführungen** gespeichert. Beim Testen im Editor merkt sich der Node nichts.\n- Die **Knapp-verfehlt-Liste** zeigt die drei Abgewiesenen, die der Schwelle am nächsten kamen. Ohne sie ist ein Radar, der jeden Morgen „0\" meldet, von einem abgeschalteten Radar nicht zu unterscheiden.\n- Die **Feld-Normalisierung** ist der Teil, den du an deinen Feed anpassen musst. Jeder Feed liefert andere Felder.\n\n**Vor dem ersten Lauf einstellen**\n`MIN_FESTPREIS_USD` und `MIN_STUNDE_USD` im Vorfilter · die Feed-URL · die Telegram-Credential · die Chat-ID.",
+        "height": 700,
+        "width": 520,
+        "color": 4
+      },
+      "id": "b2000000-0000-4000-8000-000000000001",
+      "name": "Anleitung",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -380,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "b2000000-0000-4000-8000-000000000002",
+      "name": "Täglich 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://BEISPIEL-FEED.example/rss",
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000003",
+      "name": "Feed lesen",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        400,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Feld-Normalisierung · an den eigenen Feed anpassen ===\n// Jeder RSS-Feed liefert andere Felder. Hier wird aus Titel und Text\n// herausgezogen, was der Vorfilter braucht: Budget, Währung, Art.\nconst KURS_ZU_USD = { USD:1, EUR:1.08, GBP:1.27, CHF:1.12 }; // grob, reicht zum Filtern\n\nconst out = [];\nfor (const item of $input.all()) {\n  const d    = item.json;\n  const text = `${d.title || ''} ${d.contentSnippet || d.content || ''}`;\n\n  // Währung erkennen\n  let waehrung = 'USD';\n  const wSym = text.match(/(₹|€|£|\\$)/);\n  const wIso = text.match(/\\b(USD|EUR|GBP|INR|PKR|BDT|PHP|NGN|LKR|CHF)\\b/);\n  if (wIso) waehrung = wIso[1].toUpperCase();\n  else if (wSym) waehrung = { '₹':'INR', '€':'EUR', '£':'GBP', '$':'USD' }[wSym[1]];\n\n  // Beträge einsammeln, größten als Obergrenze nehmen\n  const zahlen = (text.match(/[\\d][\\d.,]{1,12}/g) || [])\n    .map(s => Number(s.replace(/\\.(?=\\d{3}\\b)/g, '').replace(',', '.')))\n    .filter(n => !isNaN(n) && n > 0);\n  const max = zahlen.length ? Math.max(...zahlen) : 0;\n\n  // Stunden- oder Festpreis\n  const proStunde = /\\b(hour|hourly|\\/\\s?hr|per hour|stunde|stundensatz)\\b/i.test(text);\n\n  out.push({ json: {\n    title:   d.title || '',\n    link:    d.link  || '',\n    guid:    d.guid  || d.id || d.link || '',\n    content: d.contentSnippet || d.content || '',\n    currency: waehrung,\n    type: proStunde ? 'hourly' : 'fixed',\n    budgetUsdMax: Math.round(max * (KURS_ZU_USD[waehrung] || 1))\n  }});\n}\nreturn out;\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000004",
+      "name": "Feld-Normalisierung",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Job-Radar · Vorfilter v2 ===\n// Neu gegenüber v1: Merkliste (nichts wird zweimal gemeldet),\n// saubere Typ-Erkennung und eine \"knapp verfehlt\"-Liste.\nconst NUR_MARKIEREN    = false;  // true = nichts wegwerfen, nur markieren\n\nconst MIN_FESTPREIS_USD = 1600;  // eigene Untergrenze setzen\nconst MIN_STUNDE_USD    = 43;\nconst MERKEN_TAGE       = 30;\nconst KNAPP_ANTEIL      = 0.6;   // ab 60 % der Schwelle = knapp verfehlt\nconst MAX_KNAPP         = 3;\n\nconst RAUS_WAEHRUNG = ['INR','PKR','BDT','PHP','NGN','LKR'];\nconst RAUS_BEGRIFF  = /\\b(review|bewertung|clone|voice.?clone|deepfake|backlink|faceless|follower)\\b/i;\n\nconst sd      = $getWorkflowStaticData('global');\nconst gesehen = sd.jobGesehen || (sd.jobGesehen = {});\nconst jetzt   = Date.now();\nconst haltbar = MERKEN_TAGE * 24 * 3600 * 1000;\n\nconst out = [], knapp = [], zaehler = {};\nlet neu = 0, bekannt = 0;\nconst zaehl = k => { zaehler[k] = (zaehler[k] || 0) + 1; };\n\nfor (const item of $input.all()) {\n  const d = item.json;\n  const schluessel = String(d.guid || d.link || d.title || '').trim();\n  if (!schluessel)        { zaehl('Ohne Kennung'); continue; }\n  if (gesehen[schluessel]) { bekannt++; continue; }   // schon gemeldet\n\n  const text  = `${d.title || ''} ${d.content || ''}`;\n  const max   = Number(d.budgetUsdMax) || 0;\n  const label = String(d.type || '');\n\n  let proStunde = /hour|stunde/i.test(label);\n  let typUnklar = false;\n  // Festpreis unter 150 USD ist fast immer ein falsch erkannter Stundensatz\n  if (!proStunde && max > 0 && max < 150) { proStunde = true; typUnklar = true; }\n\n  let grund = null;\n  if (RAUS_WAEHRUNG.includes(String(d.currency || '').toUpperCase())) grund = 'Währung ' + d.currency;\n  else if (max === 0)                             grund = 'Budget unbekannt';\n  else if (proStunde && max < MIN_STUNDE_USD)     grund = 'Stundensatz zu niedrig';\n  else if (!proStunde && max < MIN_FESTPREIS_USD) grund = 'Budget zu niedrig';\n  else if (RAUS_BEGRIFF.test(text))               grund = 'Begriff: ' + text.match(RAUS_BEGRIFF)[0].toLowerCase();\n\n  gesehen[schluessel] = jetzt;\n  neu++;\n  zaehl(grund || 'durch');\n\n  if (grund === 'Budget zu niedrig' || grund === 'Stundensatz zu niedrig') {\n    const schwelle = proStunde ? MIN_STUNDE_USD : MIN_FESTPREIS_USD;\n    if (max >= schwelle * KNAPP_ANTEIL) {\n      knapp.push({ titel: String(d.title || '').slice(0, 80), usd: max, schwelle, link: d.link || '', typUnklar });\n    }\n  }\n\n  if (!grund || NUR_MARKIEREN) {\n    out.push({ json: { ...d, _raus: !!grund, _raus_grund: grund, _proStunde: proStunde, _typUnklar: typUnklar } });\n  }\n}\n\n// Merkliste aufräumen\nfor (const k of Object.keys(gesehen)) if (jetzt - gesehen[k] > haltbar) delete gesehen[k];\n\nknapp.sort((a, b) => (b.usd / b.schwelle) - (a.usd / a.schwelle));\n\nconsole.log('Vorfilter:', $input.all().length, 'rein |', neu, 'neu |', bekannt, 'bekannt |', out.length, 'durch ->', zaehler);\n\n// Immer genau ein Ergebnis-Objekt für die Meldung mitgeben\nreturn [{ json: {\n  treffer: out.map(o => o.json),\n  geprueft: $input.all().length,\n  neu, bekannt,\n  gruende: zaehler,\n  knapp: knapp.slice(0, MAX_KNAPP)\n}}];\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000005",
+      "name": "Vorfilter v2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Meldung bauen ===\nconst d = $input.first().json;\nconst g = d.gruende || {};\n\nconst zeilen = Object.entries(g)\n  .filter(([k]) => k !== 'durch')\n  .sort((a, b) => b[1] - a[1])\n  .map(([k, v]) => `${v}× ${k}`);\n\nlet t = `<b>Job-Radar</b>\\n${d.neu} neu geprüft, ${d.bekannt} schon bekannt, ${g.durch || 0} durch.`;\nif (zeilen.length) t += `\\n${zeilen.join(' · ')}`;\n\nif (d.treffer && d.treffer.length) {\n  t += `\\n\\n<b>Treffer:</b>`;\n  for (const j of d.treffer) {\n    t += `\\n• ${j.budgetUsdMax} USD – ${String(j.title).slice(0, 90)}\\n${j.link}`;\n  }\n}\n\nif (d.knapp && d.knapp.length) {\n  t += `\\n\\n<b>Knapp verfehlt:</b>`;\n  for (const k of d.knapp) {\n    t += `\\n• ${k.usd} von ${k.schwelle} USD${k.typUnklar ? ' (Typ unklar)' : ''} – ${k.titel}\\n${k.link}`;\n  }\n}\n\nreturn [{ json: { text: t } }];\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000006",
+      "name": "Meldung bauen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "DEINE_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "b2000000-0000-4000-8000-000000000007",
+      "name": "Telegram senden",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        140
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLATZHALTER",
+          "name": "Telegram (Platzhalter)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Vor dem Push auf GitHub\n`chatId` und Credential-Name sind Platzhalter.\nWer seine Chat-ID nicht im Repo haben will, setzt sie als Umgebungsvariable:\n`={{ $env.TELEGRAM_CHAT_ID }}`",
+        "height": 200,
+        "width": 340,
+        "color": 3
+      },
+      "id": "b2000000-0000-4000-8000-000000000008",
+      "name": "Hinweis Telegram",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        280
+      ]
+    }
+  ],
+  "connections": {
+    "Täglich 06:00": {
+      "main": [
+        [
+          {
+            "node": "Feed lesen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feed lesen": {
+      "main": [
+        [
+          {
+            "node": "Feld-Normalisierung",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feld-Normalisierung": {
+      "main": [
+        [
+          {
+            "node": "Vorfilter v2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vorfilter v2": {
+      "main": [
+        [
+          {
+            "node": "Meldung bauen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Meldung bauen": {
+      "main": [
+        [
+          {
+            "node": "Telegram senden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

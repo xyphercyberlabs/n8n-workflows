@@ -1,0 +1,224 @@
+{
+  "name": "Beleg-Erfassung aus E-Mail-Anhängen",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Beleg-Erfassung aus E-Mail-Anhängen\n\n**Was er tut:** Holt neue Mails aus einem Postfach, nimmt die PDF-Anhänge, liest den Text heraus und erkennt **Lieferant, Rechnungsnummer, Datum und Betrag**. Sicher Erkanntes geht in die Tabelle, Unsicheres in die Prüfspur.\n\n**Ohne Cloud.** Kein OCR-Dienst, keine US-Anbieter. Der PDF-Text wird lokal gelesen, die Felder mit Mustererkennung gezogen. Alles bleibt auf dem eigenen Server – das ist der Unterschied, auf den es bei Belegen ankommt.\n\n**Grenzen, ehrlich benannt**\n- Funktioniert bei **Text-PDFs**. Eine eingescannte Papierrechnung ist ein Bild – dafür braucht es zusätzlich OCR (z. B. Tesseract oder OCRmyPDF auf demselben Server).\n- Die Muster sind auf **deutsche Rechnungen** ausgelegt. Andere Sprachen brauchen andere Schlüsselwörter.\n- `pruefen = true` heißt: weniger als drei der vier Felder sicher erkannt. **Diese Belege werden nicht automatisch gebucht.**\n\n**Und der wichtigste Satz:** Dieser Workflow **erfasst**, er bucht nicht. Erlaubt ist nach **§ 6 Nr. 3 StBerG** nur die mechanische Erfassung. Das Kontieren von Belegen und das Einrichten der Buchführung gehören ausdrücklich nicht dazu und bleiben Steuerberatern vorbehalten. Wer Belege maschinell vorerfasst, liefert eine Vorarbeit – die steuerliche Würdigung bleibt beim Steuerberater. Für die Aufbewahrung gelten die **GoBD**: Original-PDF unverändert archivieren, die erfassten Felder sind nur ein Index.\n\n**Anschließen**\nAm Ausgang „In Tabelle\" hängt man an, was man nutzt: Google Sheets, Excel, Baserow, NocoDB, PostgreSQL. Am Ausgang „Prüfen\" eine Mail an die Buchhaltung oder eine Aufgabe.",
+        "height": 800,
+        "width": 560,
+        "color": 4
+      },
+      "id": "c3000000-0000-4000-8000-000000000001",
+      "name": "Anleitung",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -400,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "postProcessAction": "read",
+        "format": "resolved",
+        "options": {
+          "customEmailConfig": "[\"UNSEEN\"]"
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000002",
+      "name": "Postfach (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        220,
+        160
+      ],
+      "credentials": {
+        "imap": {
+          "id": "PLATZHALTER",
+          "name": "IMAP Belegpostfach (Platzhalter)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Nur PDF-Anhänge, je Anhang ein Item ===\n// Vereinheitlicht die Binärdaten auf den Namen \"data\",\n// damit der nächste Node einen festen Feldnamen hat.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const bin = item.binary || {};\n  for (const key of Object.keys(bin)) {\n    const b    = bin[key];\n    const name = String(b.fileName || '').toLowerCase();\n    const typ  = String(b.mimeType || '').toLowerCase();\n    if (typ !== 'application/pdf' && !name.endsWith('.pdf')) continue;\n\n    out.push({\n      json: {\n        absender:  item.json.from    || '',\n        betreff:   item.json.subject || '',\n        empfangen: item.json.date    || new Date().toISOString(),\n        dateiname: b.fileName || 'unbenannt.pdf'\n      },\n      binary: { data: b }\n    });\n  }\n}\n\nif (out.length === 0) console.log('Keine PDF-Anhänge in dieser Mail.');\nreturn out;\n"
+      },
+      "id": "c3000000-0000-4000-8000-000000000003",
+      "name": "Nur PDF-Anhänge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000004",
+      "name": "Text aus PDF",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        620,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Felder aus dem Rechnungstext erkennen ===\n// Reine Textarbeit, kein externer Dienst, keine Cloud.\n// Erwartet den PDF-Text im Feld \"text\" (liefert \"Aus Datei extrahieren\").\n\nconst deZahl = s => {\n  if (!s) return null;\n  let t = String(s).trim().replace(/[^\\d.,-]/g, '');\n  if (t.includes(',') && t.includes('.')) t = t.replace(/\\./g, '').replace(',', '.');\n  else if (t.includes(',')) t = t.replace(',', '.');\n  const n = Number(t);\n  return isNaN(n) ? null : n;\n};\n\nconst isoDatum = s => {\n  if (!s) return null;\n  const a = s.match(/(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (a) return `${a[1]}-${a[2]}-${a[3]}`;\n  const b = s.match(/(\\d{1,2})[.\\/](\\d{1,2})[.\\/](\\d{2,4})/);\n  if (!b) return null;\n  let [, t, m, j] = b;\n  if (j.length === 2) j = (Number(j) > 70 ? '19' : '20') + j;\n  return `${j}-${String(m).padStart(2,'0')}-${String(t).padStart(2,'0')}`;\n};\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const roh   = String(item.json.text || '');\n  const text  = roh.replace(/\\r/g, '');\n  const flach = text.replace(/\\n/g, ' ');\n\n  // --- Rechnungsnummer ---\n  const mNr = flach.match(/(?:Rechnung(?:s)?[-\\s]?(?:Nr\\.?|Nummer)|Invoice\\s*(?:No\\.?|Number)|Beleg(?:nr|nummer))\\s*[:.]?\\s*([A-Za-z0-9][A-Za-z0-9\\/\\-\\.]{2,24})/i);\n  const rechnungsnummer = mNr ? mNr[1].replace(/[.,;]$/, '') : null;\n\n  // --- Datum: bevorzugt das neben \"Rechnungsdatum\" ---\n  const mDat = flach.match(/(?:Rechnungsdatum|Belegdatum|Datum|Invoice date)\\s*[:.]?\\s*([0-9]{1,2}[.\\/][0-9]{1,2}[.\\/][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})/i);\n  const datum = isoDatum(mDat ? mDat[1] : flach);\n\n  // --- Bruttobetrag ---\n  const mBetrag = flach.match(/(?:Gesamtbetrag|Rechnungsbetrag|Gesamtsumme|Endbetrag|Zu zahlen(?:der Betrag)?|Brutto(?:betrag)?|Total(?:\\s*amount)?)\\D{0,20}([0-9][0-9.\\s]*,[0-9]{2}|[0-9][0-9,\\s]*\\.[0-9]{2})/i);\n  let betrag = mBetrag ? deZahl(mBetrag[1]) : null;\n\n  // Fallback: größter Betrag mit zwei Nachkommastellen im Text\n  if (betrag === null) {\n    const alle = (flach.match(/[0-9][0-9.\\s]*,[0-9]{2}|[0-9][0-9,\\s]*\\.[0-9]{2}/g) || [])\n      .map(deZahl).filter(n => n !== null);\n    if (alle.length) betrag = Math.max(...alle);\n  }\n\n  // --- Währung, Steuersatz, IBAN ---\n  const mWaehrung = flach.match(/\\b(EUR|USD|CHF|GBP)\\b|(€)/);\n  const waehrung  = mWaehrung ? (mWaehrung[1] || 'EUR') : 'EUR';\n\n  const mUst = flach.match(/(\\d{1,2}(?:[.,]\\d)?)\\s*%\\s*(?:USt|MwSt|Umsatzsteuer|VAT)?/i);\n  const steuersatz = mUst ? deZahl(mUst[1]) : null;\n\n  const mIban = flach.match(/\\b([A-Z]{2}\\d{2}(?:\\s?[A-Z0-9]{4}){2,7}[A-Z0-9]{0,4})\\b/);\n  const iban = mIban ? mIban[1].replace(/\\s/g, '') : null;\n\n  const mUstId = flach.match(/\\b(DE\\s?\\d{9}|[A-Z]{2}\\s?[A-Z0-9]{8,12})\\b(?=[^A-Z0-9]|$)/);\n  const ustId = mUstId && /USt|VAT|Steuernummer/i.test(flach) ? mUstId[1].replace(/\\s/g, '') : null;\n\n  // --- Lieferant: erste brauchbare Zeile des Dokuments ---\n  const zeilen = text.split('\\n').map(z => z.trim()).filter(Boolean);\n  const lieferant = (zeilen.find(z =>\n    z.length > 3 && z.length < 60 &&\n    !/^(rechnung|invoice|seite|page|datum|kunde)/i.test(z) &&\n    /[A-Za-zÄÖÜäöüß]/.test(z)\n  ) || '').slice(0, 60) || null;\n\n  // --- Wie sicher ist das? ---\n  const gefunden = [rechnungsnummer, datum, betrag, lieferant].filter(v => v !== null && v !== '').length;\n  const pruefen  = gefunden < 3 || betrag === null;\n\n  out.push({ json: {\n    lieferant, rechnungsnummer, datum,\n    betrag_brutto: betrag, waehrung, steuersatz, iban, ust_id: ustId,\n    dateiname: item.json.dateiname || '',\n    absender:  item.json.absender  || '',\n    betreff:   item.json.betreff   || '',\n    empfangen: item.json.empfangen || '',\n    felder_gefunden: gefunden,\n    pruefen,\n    erfasst_am: new Date().toISOString()\n  }});\n}\n\nreturn out;\n"
+      },
+      "id": "c3000000-0000-4000-8000-000000000005",
+      "name": "Felder erkennen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pruefen-check",
+              "leftValue": "={{ $json.pruefen }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000006",
+      "name": "Sicher erkannt?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1020,
+        160
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "c3000000-0000-4000-8000-000000000007",
+      "name": "In Tabelle",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        80
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "c3000000-0000-4000-8000-000000000008",
+      "name": "Prüfen",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Hier anschließen\n**oben:** Google Sheets / Excel / Baserow / PostgreSQL – eine Zeile je Beleg.\n**unten:** Mail an die Buchhaltung mit dem PDF im Anhang.\n\nDas Original-PDF immer unverändert archivieren (GoBD).",
+        "height": 220,
+        "width": 340,
+        "color": 5
+      },
+      "id": "c3000000-0000-4000-8000-000000000009",
+      "name": "Hinweis Ausgänge",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Postfach (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Nur PDF-Anhänge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nur PDF-Anhänge": {
+      "main": [
+        [
+          {
+            "node": "Text aus PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text aus PDF": {
+      "main": [
+        [
+          {
+            "node": "Felder erkennen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Felder erkennen": {
+      "main": [
+        [
+          {
+            "node": "Sicher erkannt?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sicher erkannt?": {
+      "main": [
+        [
+          {
+            "node": "In Tabelle",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prüfen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "name": "Kontakt-Vorfilter (Honeypot + Drosselung)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Kontakt-Vorfilter mit Honeypot und Drosselung\n\n**Was er tut:** Nimmt ein Kontaktformular per Webhook an, antwortet **sofort mit 200** und wirft Bot-Einsendungen weg, bevor sie irgendwo landen.\n\n**Vier Prüfungen**\n1. **Honeypot** – ein für Menschen unsichtbares Feld `website`. Ist es ausgefüllt, war es ein Bot.\n2. **Zeitfalle** – das Formular schickt `dauer` (ms zwischen Laden und Absenden). Unter 2,5 s ist niemand.\n3. **Plausibilität** – Pflichtfelder, E-Mail-Form, Feldlängen, Anzahl Links.\n4. **Drosselung** – höchstens 3 Anfragen je IP in 60 Minuten, gemerkt in `staticData`, mit automatischer Aufräumung.\n\n**Wichtig**\n- Der Webhook antwortet **„Immediately\"**. Wenn der Code-Node `[]` zurückgibt und der Webhook auf eine Antwort wartet, hängt der Absender bis zum Timeout.\n- Abgewiesene Anfragen bekommen trotzdem **200** – ein Bot soll nicht lernen, dass er erkannt wurde.\n- `staticData` wird **nur bei produktiven Ausführungen** gespeichert. Im Editor merkt sich die Drosselung nichts. Das ist kein Fehler.\n- Den Webhook-Pfad vor dem Produktivbetrieb **durch eine eigene UUID ersetzen**.\n\n**HTML für das Honeypot-Feld** (nicht `type=\"hidden\"` – das füllen Bots nicht aus):\n```html\n<div aria-hidden=\"true\" style=\"position:absolute;left:-9999px\">\n  <label>Website</label>\n  <input type=\"text\" name=\"website\" tabindex=\"-1\" autocomplete=\"off\">\n</div>\n<input type=\"hidden\" name=\"dauer\" id=\"dauer\">\n<script>const T0=Date.now();\ndocument.querySelector('form').addEventListener('submit',()=>{\n  document.getElementById('dauer').value=Date.now()-T0;});</script>\n```",
+        "height": 760,
+        "width": 560,
+        "color": 4
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Anleitung",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -340,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "BITTE-EIGENE-UUID-EINSETZEN",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Formular empfangen",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        280,
+        120
+      ],
+      "webhookId": "BITTE-EIGENE-UUID-EINSETZEN"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Kontakt-Vorfilter · Honeypot, Zeitfalle, Drosselung ===\n// Alle Stellschrauben stehen hier oben.\nconst MIN_MS        = 2500;  // schneller als das = Bot\nconst MAX_PRO_IP    = 3;     // Anfragen je IP im Fenster\nconst FENSTER_MIN   = 60;    // Länge des Fensters in Minuten\nconst MAX_LINKS     = 2;     // erlaubte Links in der Nachricht\nconst MAX_NAME      = 100;\nconst MAX_NACHRICHT = 5000;\n\nconst sd      = $getWorkflowStaticData('global');\nconst jetzt   = Date.now();\nconst fenster = FENSTER_MIN * 60 * 1000;\nconst out     = [];\n\nfor (const item of $input.all()) {\n  const b = item.json.body || item.json;\n  const h = item.json.headers || {};\n\n  const ip = String(h['x-forwarded-for'] || h['x-real-ip'] || '')\n    .split(',')[0].trim() || 'unbekannt';\n\n  const name      = String(b.name || '').trim();\n  const email     = String(b.email || '').trim();\n  const nachricht = String(b.nachricht || '').trim();\n  const falle     = String(b.website || '').trim();   // Honeypot-Feld\n  const dauer     = Number(b.dauer) || 0;             // ms zwischen Laden und Absenden\n\n  let grund = null;\n  if (falle)                                   grund = 'Honeypot ausgefüllt';\n  else if (dauer > 0 && dauer < MIN_MS)        grund = `Zu schnell (${dauer} ms)`;\n  else if (!name || !email || !nachricht)      grund = 'Pflichtfeld fehlt';\n  else if (!/^[^\\s@]+@[^\\s@]+\\.[a-z]{2,}$/i.test(email)) grund = 'E-Mail unplausibel';\n  else if (name.length > MAX_NAME || nachricht.length > MAX_NACHRICHT) grund = 'Feld zu lang';\n  else if ((nachricht.match(/https?:\\/\\//gi) || []).length > MAX_LINKS) grund = 'Zu viele Links';\n\n  // Drosselung je IP\n  if (!grund && ip !== 'unbekannt') {\n    const sp    = sd.kontaktIps || (sd.kontaktIps = {});\n    const liste = (sp[ip] || []).filter(t => jetzt - t < fenster);\n    if (liste.length >= MAX_PRO_IP) grund = `Drosselung: ${liste.length} in ${FENSTER_MIN} min`;\n    else { liste.push(jetzt); sp[ip] = liste; }\n  }\n\n  // Merkliste alle 6 Stunden aufräumen\n  if (sd.kontaktIps && jetzt - (sd.letzteReinigung || 0) > 6 * 3600 * 1000) {\n    for (const k of Object.keys(sd.kontaktIps)) {\n      const rest = sd.kontaktIps[k].filter(t => jetzt - t < fenster);\n      if (rest.length) sd.kontaktIps[k] = rest; else delete sd.kontaktIps[k];\n    }\n    sd.letzteReinigung = jetzt;\n  }\n\n  if (grund) { console.log('Kontakt abgewiesen:', grund, '| IP', ip); continue; }\n\n  out.push({ json: {\n    name, email, nachricht,\n    firma:   String(b.firma   || '').trim(),\n    telefon: String(b.telefon || '').trim(),\n    quelle:  b.quelle  || '',\n    sprache: b.sprache || '',\n    eingegangen: new Date(jetzt).toISOString()\n  }});\n}\n\nreturn out;\n"
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Vorfilter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Saubere Anfrage",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        720,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Hier weiter\nAn diesen Ausgang kommen nur geprüfte Anfragen.\nTypisch: Mail an dich, Eintrag ins CRM, Eingangsbestätigung an den Absender.",
+        "height": 160,
+        "width": 320,
+        "color": 5
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Hinweis Ausgang",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        680,
+        260
+      ]
+    }
+  ],
+  "connections": {
+    "Formular empfangen": {
+      "main": [
+        [
+          {
+            "node": "Vorfilter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vorfilter": {
+      "main": [
+        [
+          {
+            "node": "Saubere Anfrage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
