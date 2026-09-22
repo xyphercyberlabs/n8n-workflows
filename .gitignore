@@ -1,0 +1,15 @@
+# Zugangsdaten und lokale Konfiguration
+.env
+.env.*
+*.key
+*.pem
+credentials*
+*.local.json
+
+# n8n-Exporte mit Echtdaten
+*-export*.json
+*-backup*.json
+
+# System
+.DS_Store
+Thumbs.db
